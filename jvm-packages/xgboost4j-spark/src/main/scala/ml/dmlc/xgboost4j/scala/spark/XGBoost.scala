@@ -16,9 +16,10 @@
 
 package ml.dmlc.xgboost4j.scala.spark
 
+import java.io.ByteArrayInputStream
+
 import scala.collection.mutable
 import scala.util.Random
-
 import ml.dmlc.xgboost4j.java.{IRabitTracker, Rabit, XGBoostError, RabitTracker => PyRabitTracker}
 import ml.dmlc.xgboost4j.scala.rabit.RabitTracker
 import ml.dmlc.xgboost4j.scala.{XGBoost => SXGBoost, _}
@@ -102,7 +103,7 @@ object XGBoost extends Serializable {
       obj: ObjectiveTrait,
       eval: EvalTrait,
       useExternalMemory: Boolean,
-      missing: Float): RDD[Booster] = {
+      missing: Float): RDD[Array[Byte]] = {
     val partitionedData = if (data.getNumPartitions != numWorkers) {
       logger.info(s"repartitioning training set to $numWorkers partitions")
       data.repartition(numWorkers)
@@ -138,7 +139,9 @@ object XGBoost extends Serializable {
         val booster = SXGBoost.train(watches.train, params, round,
           watches = watches.toMap, obj = obj, eval = eval,
           earlyStoppingRound = numEarlyStoppingRounds)
-        Iterator(booster)
+        val bytes = booster.toByteArray
+        booster.dispose
+        Iterator(bytes)
       } finally {
         Rabit.shutdown()
         watches.delete()
@@ -326,12 +329,12 @@ object XGBoost extends Serializable {
       val sc = trainingData.sparkContext
       val parallelismTracker = new SparkParallelismTracker(sc, timeoutRequestWorkers, nWorkers)
       val overriddenParams = overrideParamsAccordingToTaskCPUs(params, trainingData.sparkContext)
-      val boosters = buildDistributedBoosters(trainingData, overriddenParams,
+      val boosterBytes = buildDistributedBoosters(trainingData, overriddenParams,
         tracker.getWorkerEnvs, nWorkers, round, obj, eval, useExternalMemory, missing)
       val sparkJobThread = new Thread() {
         override def run() {
           // force the job
-          boosters.foreachPartition(() => _)
+          boosterBytes.foreachPartition(() => _)
         }
       }
       sparkJobThread.setUncaughtExceptionHandler(tracker)
@@ -339,7 +342,7 @@ object XGBoost extends Serializable {
       val isClsTask = isClassificationTask(params)
       val trackerReturnVal = parallelismTracker.execute(tracker.waitFor(0L))
       logger.info(s"Rabit returns with exit code $trackerReturnVal")
-      val model = postTrackerReturnProcessing(trackerReturnVal, boosters, overriddenParams,
+      val model = postTrackerReturnProcessing(trackerReturnVal, boosterBytes, overriddenParams,
         sparkJobThread, isClsTask)
       if (isClsTask){
         model.asInstanceOf[XGBoostClassificationModel].numOfClasses =
@@ -352,11 +355,13 @@ object XGBoost extends Serializable {
   }
 
   private def postTrackerReturnProcessing(
-      trackerReturnVal: Int, distributedBoosters: RDD[Booster],
+      trackerReturnVal: Int, distributedBoosters: RDD[Array[Byte]],
       params: Map[String, Any], sparkJobThread: Thread, isClassificationTask: Boolean):
     XGBoostModel = {
     if (trackerReturnVal == 0) {
-      val xgboostModel = XGBoostModel(distributedBoosters.first(), isClassificationTask)
+      val bais = new ByteArrayInputStream(distributedBoosters.first())
+      val booster = SXGBoost.loadModel(bais)
+      val xgboostModel = XGBoostModel(booster, isClassificationTask)
       distributedBoosters.unpersist(false)
       xgboostModel
     } else {
